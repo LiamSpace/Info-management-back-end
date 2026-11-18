@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const { validateUser, userId, validateUserIds } = require('./validation');
 const { parseUsers } = require('./excel');
+const { validateReferences } = require('../dictionaries/service');
 
 function collection() {
   return mongoose.connection.db.collection('users-list');
@@ -12,12 +13,14 @@ async function listUsers() {
 
 async function createUser(input) {
   const user = validateUser(input);
+  await validateReferences([user]);
   const result = await collection().insertOne(user);
   return { ...user, _id: result.insertedId };
 }
 
 async function importUsers(buffer) {
   const users = await parseUsers(buffer);
+  await validateReferences(users);
   const result = await collection().insertMany(users, { ordered: true });
   return {
     insertedCount: result.insertedCount,
@@ -28,6 +31,9 @@ async function importUsers(buffer) {
 async function updateUser(id, input) {
   const objectId = userId(id);
   const updates = validateUser(input, true);
+  const previous = await collection().findOne({ _id: objectId });
+  if (!previous) return null;
+  await validateReferences([updates], [previous]);
   return collection().findOneAndUpdate(
     { _id: objectId },
     { $set: updates },

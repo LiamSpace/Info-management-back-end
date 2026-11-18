@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ensureIndexes } = require('../modules/dictionaries/service');
 
 mongoose.connection.on('connected', () => {
     console.log('MongoDB 已连接, 数据库: ', mongoose.connection.name);
@@ -19,6 +20,7 @@ async function connectDB() {
     await mongoose.connect(process.env.MONGODB_URI, {
         serverSelectionTimeoutMS: 5000
     })
+    await ensureIndexes(mongoose.connection.db);
 }
 
 

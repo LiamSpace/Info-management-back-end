@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { z: zod } = require('zod');
+const { httpError } = require('../../utils/http-error');
 
 const MAX_USERS = 1000;
 const MAX_FIELDS = 50;
@@ -7,9 +8,7 @@ const ID_ERROR = '用户 ID 必须是 24 位十六进制字符串';
 const IDS_ERROR = `ids 必须是包含 1 至 ${MAX_USERS} 个用户 ID 的数组`;
 
 function invalid(message) {
-  const error = new Error(message);
-  error.statusCode = 400;
-  return error;
+  return httpError(400, message);
 }
 
 function validField(field) {

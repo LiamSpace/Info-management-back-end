@@ -1,7 +1,7 @@
-const mongoose = require('mongoose');
 const multer = require('multer');
 const { invalid } = require('./validation');
 const { failure } = require('../../utils/response');
+const { asyncHandler, prepareRequest } = require('../../middleware/api');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -13,18 +13,6 @@ const upload = multer({
     callback(null, true);
   }
 });
-
-function asyncHandler(handler) {
-  return (req, res, next) => Promise.resolve().then(() => handler(req, res)).catch(next);
-}
-
-function prepareRequest(req, res, next) {
-  res.set('Cache-control', 'no-store');
-  if (mongoose.connection.readyState !== 1) {
-    return failure(res, 503, '数据库尚未连接');
-  }
-  next();
-}
 
 function handleError(error, req, res, next) {
   if (error instanceof multer.MulterError || error.statusCode === 400) {

@@ -16,6 +16,9 @@ const originalDb = mongoose.connection.db;
 const originalState = mongoose.connection.readyState;
 
 const users = {
+  async findOne(filter) {
+    return records.get(String(filter._id)) || null;
+  },
   find() {
     return { toArray: async () => [...records.values()] };
   },

@@ -5,6 +5,7 @@ var logger = require('morgan');
 
 var indexRouter = require('./routes/index');
 var usersRouter = require('./routes/users');
+const dictionariesRouter = require('./routes/dictionaries');
 const helmet = require('helmet');
 const cors = require('cors');
 const { failure } = require('./utils/response');
@@ -30,6 +31,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/', indexRouter);
 app.use('/api/users', usersRouter);
+app.use('/api/dictionaries', dictionariesRouter);
 
 app.use('/api', (req, res) => failure(res, 404, '接口不存在'));
 
