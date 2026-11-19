@@ -6,7 +6,7 @@ const originalCorsOrigins = process.env.CORS_ORIGINS;
 const frontendOrigin = 'http://192.168.31.190:8002';
 process.env.CORS_ORIGINS = frontendOrigin;
 const app = require('../app');
-const { validateUser, userId, validateUserIds } = require('../modules/users/validation');
+const { validateUser, validateSearch, userId, validateUserIds } = require('../modules/users/validation');
 
 const records = new Map();
 let server;
@@ -19,8 +19,10 @@ const users = {
   async findOne(filter) {
     return records.get(String(filter._id)) || null;
   },
-  find() {
-    return { toArray: async () => [...records.values()] };
+  find(filter = {}) {
+    return { toArray: async () => [...records.values()].filter(user =>
+      Object.entries(filter).every(([field, condition]) => condition.$in.some(value =>
+        value === null ? user[field] === null || !Object.hasOwn(user, field) : user[field] === value))) };
   },
   async insertOne(user) {
     const insertedId = new mongoose.Types.ObjectId();
@@ -62,8 +64,11 @@ const users = {
 before(async () => {
   mongoose.connection.db = {
     collection(name) {
-      assert.equal(name, 'users-list');
       if (databaseError) throw databaseError;
+      if (name === 'dictionary-options') {
+        return { find: () => ({ toArray: async () => [] }) };
+      }
+      assert.equal(name, 'users-list');
       return users;
     }
   };
@@ -223,6 +228,118 @@ test('create, list, partially edit and delete a user', async () => {
   assert.deepEqual((await request('/list')).body.data, [edited.body.data]);
   assert.equal((await request(`/${created.body.data._id}`, 'DELETE')).body.data.deletedCount, 1);
   assert.deepEqual((await request('/list')).body.data, []);
+});
+
+test('user search combines fields with AND and selections within each field with OR', async context => {
+  for (const user of [
+    { name: 'Alice', departmentCode: 'finance', positionCode: 'lead', rankCode: 'senior', active: true },
+    { name: 'Bob', departmentCode: 'hr', positionCode: 'member', rankCode: 'senior', active: true },
+    { name: 'Carol', departmentCode: 'hr', positionCode: 'lead', rankCode: 'junior', active: true },
+    { name: 'Dave', departmentCode: 'engineering', positionCode: 'lead', rankCode: 'senior', active: true },
+    { name: 'Eve', departmentCode: 'finance', positionCode: 'member', rankCode: 'senior', active: false },
+    { name: 'Frank', departmentCode: 'finance', positionCode: 'intern', rankCode: 'senior', active: true }
+  ]) await users.insertOne(user);
+  const find = context.mock.method(users, 'find');
+  const single = await request('/search', 'POST', { filters: {
+    departmentCode: 'finance', positionCode: 'lead', rankCode: 'senior', active: true
+  } });
+  assert.equal(single.status, 200);
+  assert.equal(single.body.message, '查询成功');
+  assert.deepEqual(single.body.data.map(user => user.name), ['Alice']);
+  const multiple = await request('/search', 'POST', { filters: {
+    departmentCode: ['finance', 'hr', 'finance'], positionCode: ['lead', 'member'], rankCode: 'senior', active: true
+  } });
+  assert.equal(multiple.status, 200);
+  assert.deepEqual(multiple.body.data.map(user => user.name), ['Alice', 'Bob']);
+  assert.deepEqual(find.mock.calls[1].arguments[0], {
+    departmentCode: { $in: ['finance', 'hr'] }, positionCode: { $in: ['lead', 'member'] },
+    rankCode: { $in: ['senior'] }, active: { $in: [true] }
+  });
+  assert.equal(records.size, 6);
+  const unmatched = await request('/search', 'POST', { filters: { name: 'Nobody' } });
+  assert.equal(unmatched.status, 200);
+  assert.deepEqual(unmatched.body.data, []);
+  assert.equal((await request('/list')).body.data.length, 6);
+});
+
+test('user search ignores empty selections but retains exact scalar types and null semantics', async context => {
+  await users.insertOne({ name: 'Exact', count: 0, active: false, note: null });
+  await users.insertOne({ name: 'String', count: '0', active: 'false', note: '' });
+  await users.insertOne({ name: 'Missing', count: 1, active: true });
+  const find = context.mock.method(users, 'find');
+  const exact = await request('/search', 'POST', { filters: { count: 0, active: false, departmentCode: [] } });
+  assert.equal(exact.status, 200);
+  assert.deepEqual(exact.body.data.map(user => user.name), ['Exact']);
+  assert.deepEqual(find.mock.calls[0].arguments[0], { count: { $in: [0] }, active: { $in: [false] } });
+  for (const filters of [{}, { departmentCode: [] }]) {
+    assert.deepEqual((await request('/search', 'POST', { filters })).body.data, (await request('/list')).body.data);
+  }
+  const nulls = await request('/search', 'POST', { filters: { note: [null] } });
+  assert.deepEqual(nulls.body.data.map(user => user.name), ['Exact', 'Missing']);
+  const emptyString = await request('/search', 'POST', { filters: { note: '' } });
+  assert.deepEqual(emptyString.body.data.map(user => user.name), ['String']);
+  assert.deepEqual((await request('/search', 'POST', { filters: { name: 'Ex' } })).body.data, []);
+});
+
+test('user search rejects unsafe filters and excessive input before querying', async context => {
+  await users.insertOne({ name: 'Alice' });
+  const find = context.mock.method(users, 'find');
+  const invalidBodies = [
+    {}, [], null, { filters: null }, { filters: [] }, { filters: 'name' },
+    { filters: {}, sort: 'name' }, { filters: {}, $where: 'true' },
+    { filters: { name: { $ne: null } } }, { filters: { name: [{ $regex: '.*' }] } },
+    { filters: { name: [['Alice']] } }, { filters: { name: 'a'.repeat(4001) } },
+    { filters: { name: Array(101).fill('Alice') } },
+    { filters: Object.fromEntries(Array.from({ length: 51 }, (_, index) => [`field${index}`, 'value'])) }
+  ];
+  for (const field of ['__proto__', 'constructor', 'prototype', '_id', '$or', '$where', 'profile.name', 'name\u0000', ' name', '', 'a'.repeat(101)]) {
+    invalidBodies.push({ filters: { [field]: 'Alice' } });
+  }
+  for (const body of invalidBodies) {
+    const result = await request('/search', 'POST', body);
+    assert.equal(result.status, 400, JSON.stringify(body));
+  }
+  assert.equal(find.mock.callCount(), 0);
+  assert.equal(records.size, 1);
+});
+
+test('user search validates scalar values and accepts documented limits', async () => {
+  const input = { filters: { age: [0, 1], active: false, note: null, departmentCode: [] } };
+  const parsed = validateSearch(input);
+  assert.deepEqual(parsed, input);
+  assert.notEqual(parsed, input);
+  for (const value of [undefined, NaN, Infinity, -Infinity, new Date(), /Alice/]) {
+    assert.throws(() => validateSearch({ filters: { name: value } }), { statusCode: 400 });
+    assert.throws(() => validateSearch({ filters: { name: [value] } }), { statusCode: 400 });
+  }
+  assert.throws(() => validateSearch(undefined), { statusCode: 400 });
+  const maximumFilters = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [`field${index}`, []]));
+  const maximumValues = Array.from({ length: 100 }, (_, index) => index);
+  assert.deepEqual(validateSearch({ filters: maximumFilters }).filters, maximumFilters);
+  await users.insertOne({ name: 'A.*', age: 99 });
+  await users.insertOne({ name: 'Alice', age: 100 });
+  const boundary = await request('/search', 'POST', { filters: { age: maximumValues } });
+  assert.equal(boundary.status, 200);
+  assert.deepEqual(boundary.body.data.map(user => user.name), ['A.*']);
+  assert.deepEqual((await request('/search', 'POST', { filters: { name: 'A.*' } })).body.data, boundary.body.data);
+  assert.deepEqual((await request('/search', 'POST', { filters: { unknownField: 'value' } })).body.data, []);
+});
+
+test('user search retains CORS headers and reports unavailable databases', async () => {
+  const response = await fetch(`${baseUrl}/search`, {
+    method: 'POST',
+    headers: { Origin: frontendOrigin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: {} })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'), frontendOrigin);
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
+  assertEnvelope(response, await response.json());
+  mongoose.connection.readyState = 0;
+  assert.equal((await request('/search', 'POST', { filters: {} })).status, 503);
+  mongoose.connection.readyState = 1;
+  databaseError = new Error('connection lost');
+  assert.equal((await request('/search', 'POST', { filters: { name: ['Alice'] } })).status, 503);
 });
 
 test('rejects empty users, nested values, unsafe fields and excessive fields', async () => {

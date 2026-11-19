@@ -4,6 +4,7 @@ const { httpError } = require('../../utils/http-error');
 
 const MAX_USERS = 1000;
 const MAX_FIELDS = 50;
+const MAX_SEARCH_VALUES = 100;
 const ID_ERROR = '用户 ID 必须是 24 位十六进制字符串';
 const IDS_ERROR = `ids 必须是包含 1 至 ${MAX_USERS} 个用户 ID 的数组`;
 
@@ -53,6 +54,28 @@ const createUserSchema = userObjectSchema.refine(
 
 const updateUserSchema = userObjectSchema;
 
+const searchUsersSchema = zod.strictObject({
+  filters: zod.custom(
+    input => input !== null && typeof input === 'object' && !Array.isArray(input),
+    { error: 'filters 必须是 JSON 对象' }
+  ).superRefine((filters, context) => {
+    const fields = Object.keys(filters);
+    if (fields.length > MAX_FIELDS) {
+      context.addIssue({ code: 'custom', message: `搜索条件最多包含 ${MAX_FIELDS} 个字段` });
+    }
+    for (const field of fields) {
+      if (!validField(field)) {
+        context.addIssue({ code: 'custom', message: `不允许的搜索字段名：${field}` });
+      }
+    }
+  }).pipe(zod.record(
+    zod.string(),
+    zod.union([userValueSchema, zod.array(userValueSchema).max(MAX_SEARCH_VALUES, {
+      error: `单个搜索字段最多选择 ${MAX_SEARCH_VALUES} 个值`
+    })])
+  ))
+}, { error: '搜索请求仅允许 filters 字段' });
+
 const userIdSchema = zod.string({ error: ID_ERROR })
   .regex(/^[a-f\d]{24}$/i, { error: ID_ERROR })
   .transform(value => new mongoose.Types.ObjectId(value));
@@ -83,6 +106,10 @@ function validateUserIds(ids) {
   return parse(userIdsSchema, ids);
 }
 
+function validateSearch(input) {
+  return parse(searchUsersSchema, input);
+}
+
 module.exports = {
   MAX_USERS,
   MAX_FIELDS,
@@ -90,9 +117,11 @@ module.exports = {
   validField,
   createUserSchema,
   updateUserSchema,
+  searchUsersSchema,
   userIdSchema,
   userIdsSchema,
   validateUser,
+  validateSearch,
   userId,
   validateUserIds
 };

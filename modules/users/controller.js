@@ -7,6 +7,11 @@ async function listUsers(req, res) {
   return success(res, users, '查询成功');
 }
 
+async function searchUsers(req, res) {
+  const users = await userService.searchUsers(req.body);
+  return success(res, users, '查询成功');
+}
+
 async function createUser(req, res) {
   const user = await userService.createUser(req.body);
   return success(res, user, '新增成功', 201);
@@ -41,4 +46,4 @@ async function deleteUser(req, res) {
   return success(res, result, '删除成功');
 }
 
-module.exports = { listUsers, createUser, importUsers, updateUser, deleteUsers, deleteUser };
+module.exports = { listUsers, searchUsers, createUser, importUsers, updateUser, deleteUsers, deleteUser };

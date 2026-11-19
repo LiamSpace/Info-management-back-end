@@ -85,8 +85,8 @@ const userCollection = {
   async findOne(filter) {
     return [...users.values()].find(user => matches(user, filter)) || null;
   },
-  find() {
-    return { toArray: async () => [...users.values()] };
+  find(filter = {}) {
+    return { toArray: async () => [...users.values()].filter(user => matches(user, filter)) };
   },
   async insertOne(user) {
     const insertedId = new mongoose.Types.ObjectId();
@@ -173,6 +173,115 @@ async function seedOption(type, fields = {}) {
   return JSON.parse(JSON.stringify(options.get(String(result.insertedId))));
 }
 
+test('user dictionary responses resolve labels in one lookup for list and search without mutating storage', async context => {
+  await seedOption('department', { value: 'shared', label: 'Finance' });
+  await seedOption('position', { value: 'shared', label: 'Manager' });
+  await seedOption('rank', { value: 'shared', label: 'Senior', enabled: false });
+  const first = await userCollection.insertOne({
+    name: 'Alice', departmentCode: 'shared', positionCode: 'shared', rankCode: 'shared'
+  });
+  await userCollection.insertOne({ name: 'Bob', departmentCode: 'missing', positionCode: null, rankCode: '' });
+  await userCollection.insertOne({ name: 'Carol', department: 'Legacy free text' });
+  const before = JSON.parse(JSON.stringify([...users.values()]));
+  const find = context.mock.method(optionCollection, 'find');
+  const listed = await request('/api/users/list');
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.data, [
+    { ...before[0], departmentCode: { value: 'shared', label: 'Finance' },
+      positionCode: { value: 'shared', label: 'Manager' }, rankCode: { value: 'shared', label: 'Senior' } },
+    { ...before[1], departmentCode: { value: 'missing', label: null },
+      positionCode: { value: null, label: null }, rankCode: { value: '', label: null } },
+    before[2]
+  ]);
+  assert.equal(find.mock.callCount(), 1);
+  assert.deepEqual(find.mock.calls[0].arguments[0], {
+    type: { $in: ['department', 'position', 'rank'] }, value: { $in: ['shared', 'missing'] }
+  });
+  assert.deepEqual(find.mock.calls[0].arguments[1], { projection: { _id: 0, type: 1, value: 1, label: 1 } });
+  const searched = await request('/api/users/search', 'POST', { filters: { departmentCode: ['shared'] } });
+  assert.equal(searched.status, 200);
+  assert.deepEqual(searched.data, [listed.data[0]]);
+  assert.equal(find.mock.callCount(), 2);
+  assert.equal(users.get(String(first.insertedId)).departmentCode, 'shared');
+  assert.deepEqual(JSON.parse(JSON.stringify([...users.values()])), before);
+});
+
+test('user dictionary responses format create and update results but keep scalar request values', async () => {
+  for (const type of ['department', 'position', 'rank']) {
+    await seedOption(type, { value: 'shared', label: `${type} label` });
+  }
+  await seedOption('department', { value: 'other', label: 'Other department' });
+  const created = await request('/api/users', 'POST', {
+    name: 'Alice', departmentCode: 'shared', positionCode: 'shared', rankCode: 'shared'
+  });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.data.departmentCode, { value: 'shared', label: 'department label' });
+  assert.deepEqual(created.data.positionCode, { value: 'shared', label: 'position label' });
+  assert.deepEqual(created.data.rankCode, { value: 'shared', label: 'rank label' });
+  assert.equal(users.get(created.data._id).departmentCode, 'shared');
+  const updated = await request(`/api/users/${created.data._id}`, 'POST', {
+    departmentCode: 'other', positionCode: null
+  });
+  assert.equal(updated.status, 200);
+  assert.deepEqual(updated.data.departmentCode, { value: 'other', label: 'Other department' });
+  assert.deepEqual(updated.data.positionCode, { value: null, label: null });
+  assert.deepEqual(updated.data.rankCode, created.data.rankCode);
+  assert.equal(users.get(created.data._id).departmentCode, 'other');
+  assert.equal(users.get(created.data._id).positionCode, null);
+  assert.deepEqual((await request('/api/users/list')).data, [updated.data]);
+  assert.equal((await request('/api/users', 'POST', { name: 'Bob', departmentCode: updated.data.departmentCode })).status, 400);
+  assert.equal((await request(`/api/users/${created.data._id}`, 'POST', { departmentCode: updated.data.departmentCode })).status, 400);
+  assert.equal((await request('/api/users/search', 'POST', { filters: { departmentCode: updated.data.departmentCode } })).status, 400);
+});
+
+test('user dictionary responses reflect renamed labels without rewriting user values', async () => {
+  const option = await seedOption('department', { label: 'Original' });
+  const created = await request('/api/users', 'POST', { name: 'Alice', departmentCode: option.value });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.data.departmentCode, { value: option.value, label: 'Original' });
+  const renamed = await request('/department/options/batch', 'POST', {
+    options: [{ _id: option._id, label: 'Renamed' }]
+  });
+  assert.equal(renamed.status, 200);
+  const listed = await request('/api/users/list');
+  const searched = await request('/api/users/search', 'POST', { filters: { departmentCode: option.value } });
+  assert.deepEqual(listed.data[0].departmentCode, { value: option.value, label: 'Renamed' });
+  assert.deepEqual(searched.data, listed.data);
+  assert.equal(users.get(created.data._id).departmentCode, option.value);
+  assert.equal((await request('/department/options/batch', 'POST', { options: [] })).status, 409);
+});
+
+test('user dictionary responses avoid dictionary queries for empty results or empty reference values', async context => {
+  const find = context.mock.method(optionCollection, 'find', () => {
+    throw new Error('unexpected dictionary lookup');
+  });
+  assert.deepEqual((await request('/api/users/list')).data, []);
+  const created = await request('/api/users', 'POST', { name: 'Plain' });
+  assert.equal(created.status, 201);
+  assert.equal(Object.hasOwn(created.data, 'departmentCode'), false);
+  const updated = await request(`/api/users/${created.data._id}`, 'POST', { departmentCode: null, positionCode: '' });
+  assert.equal(updated.status, 200);
+  assert.deepEqual(updated.data.departmentCode, { value: null, label: null });
+  assert.deepEqual(updated.data.positionCode, { value: '', label: null });
+  assert.equal(Object.hasOwn(updated.data, 'rankCode'), false);
+  assert.deepEqual((await request('/api/users/list')).data, [updated.data]);
+  assert.deepEqual((await request('/api/users/search', 'POST', { filters: { name: 'Plain' } })).data, [updated.data]);
+  assert.deepEqual((await request('/api/users/search', 'POST', { filters: { name: 'Nobody' } })).data, []);
+  assert.equal(find.mock.callCount(), 0);
+  assert.equal(users.get(created.data._id).departmentCode, null);
+  assert.equal(users.get(created.data._id).positionCode, '');
+});
+
+test('user dictionary responses report lookup failure instead of returning missing labels', async context => {
+  const created = await userCollection.insertOne({ name: 'Alice', departmentCode: 'code' });
+  context.mock.method(optionCollection, 'find', () => {
+    throw new Error('dictionary lookup failed');
+  });
+  assert.equal((await request('/api/users/list')).status, 503);
+  assert.equal((await request('/api/users/search', 'POST', { filters: { departmentCode: 'code' } })).status, 503);
+  assert.equal(users.get(String(created.insertedId)).departmentCode, 'code');
+});
+
 test('dictionary configuration reads type metadata and sorted options in one query', async context => {
   const find = context.mock.method(optionCollection, 'find');
   const empty = await request('/options');
@@ -257,7 +366,7 @@ test('dictionary batch save creates options without IDs and returns stable gener
     const value = saved.data.options[0].value;
     const user = await request('/api/users', 'POST', { name: 'Alice', [userField]: value });
     assert.equal(user.status, 201);
-    assert.equal(user.data[userField], value);
+    assert.deepEqual(user.data[userField], { value, label: 'Renamed' });
     assert.equal((await importUsers([['name', userField], ['Bob', value]])).status, 201);
   }
   assert.equal(generatedValues.size, 6);
@@ -612,7 +721,7 @@ test('renaming dictionary options preserves UUID references in users and Excel',
     assert.equal(edited.data.options[0].value, created.value);
     const user = await request('/api/users', 'POST', { name: 'Alice', [userField]: created.value });
     assert.equal(user.status, 201);
-    assert.equal(user.data[userField], created.value);
+    assert.deepEqual(user.data[userField], { value: created.value, label: 'Renamed' });
     const imported = await importUsers([['name', userField], ['Bob', created.value]]);
     assert.equal(imported.status, 201);
     assert.equal(imported.data.insertedCount, 1);
@@ -666,7 +775,7 @@ test('user edits preserve inactive references, reject new ones and allow clearin
   assert.equal((await request(path, 'POST', { departmentCode: 'missing' })).status, 400);
   const cleared = await request(path, 'POST', { departmentCode: null });
   assert.equal(cleared.status, 200);
-  assert.equal(cleared.data.departmentCode, null);
+  assert.deepEqual(cleared.data.departmentCode, { value: null, label: null });
 });
 
 test('Excel validates all dictionary references before inserting any users', async () => {

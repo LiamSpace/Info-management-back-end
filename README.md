@@ -2,7 +2,7 @@
 
 接口前缀：`/api/users`。数据保存在当前 MongoDB 数据库的 `users-list` 集合中，每条文档代表一个用户，`_id` 由 MongoDB 自动生成。
 
-用户信息保留动态字段，下面的 `name`、`phone`、`email` 仅为示例；可选的 `departmentCode`、`positionCode`、`rankCode` 额外执行字典引用校验。JSON 字段名和 Excel 表头应与前端实际使用的字段名一致。单个用户支持 1 至 50 个字段，字段值支持字符串、有限数字、布尔值及 `null`，字符串最长 4000 字符。不支持嵌套对象或数组，不允许提交 `_id`、包含 `.` 或 `$` 的字段名及原型相关字段。
+用户信息保留动态字段，下面的 `name`、`phone`、`email` 仅为示例；可选的 `departmentCode`、`positionCode`、`rankCode` 额外执行字典引用校验。JSON 字段名和 Excel 表头应与前端实际使用的字段名一致。单个用户请求支持 1 至 50 个字段，字段值支持字符串、有限数字、布尔值及 `null`，字符串最长 4000 字符。请求不支持嵌套对象或数组，不允许提交 `_id`、包含 `.` 或 `$` 的字段名及原型相关字段；响应中的字典字段则使用下文的 `{ value, label }` 对象。
 
 ## 代码结构
 
@@ -13,7 +13,7 @@
 | [app.js](app.js) | Express 应用组装、全局中间件、挂载路由和请求正文解析错误处理 |
 | [routes/users.js](routes/users.js) | 声明用户接口 URL、HTTP 方法和中间件顺序 |
 | [modules/users/controller.js](modules/users/controller.js) | 读取请求参数、调用服务、设置 HTTP 状态码和响应 |
-| [modules/users/service.js](modules/users/service.js) | 组织校验、导入和 MongoDB 增删改查，不依赖 `req` 或 `res` |
+| [modules/users/service.js](modules/users/service.js) | 组织校验、导入、MongoDB 增删改查及用户字典名称批量解析，不依赖 `req` 或 `res` |
 | [modules/users/validation.js](modules/users/validation.js) | Zod schema、用户字段与 ID 校验、批量数量限制及参数错误构造 |
 | [modules/users/excel.js](modules/users/excel.js) | 将 Excel Buffer 解析为经过校验的用户数组，不访问数据库 |
 | [modules/users/middleware.js](modules/users/middleware.js) | 上传限制、复用公共请求中间件及用户接口错误响应 |
@@ -68,12 +68,13 @@ API 已启用精确来源白名单 CORS，支持凭据请求、JSON 请求头以
 | --- | --- |
 | `createUserSchema` | 新增用户及 Excel 每行数据；至少一个字段有非空值 |
 | `updateUserSchema` | 编辑提交的字段；至少提交一个字段，允许用 `null` 或空字符串置空 |
+| `searchUsersSchema` | 搜索条件对象；安全字段名、单值或多选值、条件数量限制 |
 | `userIdSchema` | 校验 24 位十六进制 ID，并转换为 MongoDB ObjectId |
 | `userIdsSchema` | 校验 1 至 1000 个 ID，每个元素复用 `userIdSchema` |
 
 用户信息使用动态对象校验：先检查字段名及数量，再通过 `z.record` 校验字段值。尚未定义姓名、手机号等固定业务字段或必填规则，不做自动去除空格或字符串转数字等类型转换；`0` 和 `false` 均是有效非空值。
 
-服务继续使用 `validateUser(input)`、`validateUser(input, true)`、`userId(value)` 和 `validateUserIds(ids)`。这些函数调用 `safeParse()`，成功时返回 `result.data`，失败时将首个问题转换为现有 HTTP `400` 错误响应。字段值错误会包含字段路径，Excel 导入还会补充行号。不要忽略返回值并写入原始输入。
+服务继续使用 `validateUser(input)`、`validateUser(input, true)`、`userId(value)` 和 `validateUserIds(ids)`；搜索使用 `validateSearch(input)`。这些函数调用 `safeParse()`，成功时返回 `result.data`，失败时将首个问题转换为现有 HTTP `400` 错误响应。字段值错误会包含字段路径，Excel 导入还会补充行号。不要忽略返回值并写入原始输入。
 
 ## 统一响应
 
@@ -125,6 +126,7 @@ const users = result.data;
 | --- | --- | --- | --- |
 | GET | `/api/health` | 无 | `200`，`{ "status": "ok" }` |
 | GET | `/api/users/list` | 无 | `200`，用户数组，空集合时 `data: []` |
+| POST | `/api/users/search` | `{ "filters": { "字段名": "单值或数组" } }` | `200`，匹配的用户数组，无匹配时 `data: []` |
 | POST | `/api/users` | 用户 JSON 对象 | `201`，包含 `_id` 的新增用户 |
 | POST | `/api/users/import` | `multipart/form-data`，文件字段为 `file` | `201`，`{ "insertedCount": 2, "ids": ["..."] }` |
 | POST | `/api/users/:id` | 需要修改的字段 | `200`，修改后的完整用户 |
@@ -140,6 +142,80 @@ JSON 请求设置 `Content-Type: application/json`。编辑仅更新提交的字
 批量删除最多接受 1000 个 ID；先验证全部 ID，再执行删除。不存在或重复的 ID 不额外计数，没有匹配用户时返回 `data.deletedCount: 0`。
 
 **兼容性变更：** 原 `/list` 返回集合中的第一条文档，现在在 `data` 中返回全部用户文档组成的数组。如果原数据库是把所有用户嵌套在一条文档里，需要先确认结构并迁移；本次没有自动迁移或修改已有数据库数据。当前列表没有分页。
+
+## 用户字典字段响应
+
+**兼容性变更：** 列表、搜索、新增和编辑接口返回的用户中，`departmentCode`、`positionCode`、`rankCode` 从原来的代码值改为 `{ value, label }` 对象。字段名和统一响应封装不变，例如列表响应：
+
+```json
+{
+  "code": 0,
+  "message": "查询成功",
+  "data": [{
+    "_id": "507f1f77bcf86cd799439011",
+    "name": "张三",
+    "departmentCode": { "value": "finance", "label": "财务部" },
+    "positionCode": { "value": "manager", "label": "经理" },
+    "rankCode": { "value": "senior", "label": "高级" }
+  }]
+}
+```
+
+示例代码应替换为实际字典的 `value`，也可以是 UUID。新增和编辑的 `data` 是同样结构的单个用户对象，列表和搜索的 `data` 是数组。
+
+- 数据库仍保存原代码字符串，不写入显示对象；新增、编辑、Excel 导入及搜索参数仍传原代码，不能直接把响应对象回传，否则返回 `400`。
+- 名称按字典类型和 `value` 联合匹配，不同类型的相同代码不会串用名称。停用项仍返回名称；不存在的选项保留原 `value`，`label` 返回 `null`。
+- 原本未提供的字典字段继续省略；存储值为 `null` 或空字符串时分别返回 `{ "value": null, "label": null }`、`{ "value": "", "label": null }`。其他用户字段原样保留。
+- 每批用户响应最多增加一次字典查询，无用户或没有非空字典字符串时跳过。字典改名后，下一次查询显示最新名称，无需改写用户记录。
+- Excel 导入响应仍只返回 `insertedCount` 和 `ids`，删除响应不变；导入后查询用户即可取得字典对象。
+
+字典名称查询失败会返回 `503`，不会用 `label: null` 伪装查询成功。新增、编辑先写入用户再解析名称，未使用事务；因此错误也可能发生在写入成功之后，前端应先查询核对，不要直接重复新增。
+
+## 用户复合搜索
+
+新增 `POST /api/users/search`，原 `GET /api/users/list` 保持不变。请求体必须包含 `filters` 对象，`Content-Type` 为 `application/json`，接口只查询、不修改数据。
+
+搜索规则：不同字段之间为 AND，同一字段的多个选值之间为 OR。例如 `a: [a1, a2, a3]`、`b: [b2, b3]`、`c`、`d` 表示 `(a1 或 a2 或 a3) 且 (b2 或 b3) 且 c 且 d`。
+
+单选条件叠加示例：
+
+```json
+{
+  "filters": {
+    "departmentCode": "department-value-1",
+    "positionCode": "position-value-1",
+    "rankCode": "rank-value-1",
+    "name": "张三"
+  }
+}
+```
+
+同字段多选、不同字段同时满足，前端 Axios 示例：
+
+```js
+const response = await axios.post('/api/users/search', {
+  filters: {
+    departmentCode: ['department-value-1', 'department-value-2', 'department-value-3'],
+    positionCode: ['position-value-2', 'position-value-3'],
+    rankCode: 'rank-value-1',
+    name: '张三'
+  }
+});
+if (response.data.code !== 0) throw new Error(response.data.message);
+this.userList = response.data.data;
+```
+
+上面的字段名应与用户记录一致，字典条件的示例值需替换为字典接口返回的实际 `value`（UUID 或已有业务代码），不是 `label` 或 `_id`。搜索不要求选项当前启用，已有用户保存的历史代码也能查询。
+
+- 单值和数组都支持字符串、有限数字、布尔值及 `null`；每个字段使用精确匹配，不自动做模糊查询、正则匹配、范围查询或类型转换，字符串不自动去除空格。
+- `0`、`false`、空字符串是有效筛选值，不会被忽略；数字 `0` 不匹配字符串 `"0"`。
+- 未选择的字段应省略或传 `[]`，空数组不参与查询。`{ "filters": {} }` 或全部条件为空数组时返回全部用户。
+- `null` 不是忽略条件：沿用 MongoDB 查询语义，匹配字段值为 `null` 或字段不存在的用户。
+- 最多 50 个筛选字段，每个字段的数组最多 100 个值，字符串最多 4000 字符；数组中的重复值在构造查询时去重，数量上限按去重前计算。
+- 字段名复用用户字段规则：长度 1 至 100，不允许首尾空格、点、美元符、控制字符、`_id`、`__proto__`、`constructor`、`prototype`。不接受嵌套对象或客户端传入的 `$in`、`$or`、`$regex` 等查询操作符。
+- 请求顶层只允许 `filters`。缺少 `filters`、无效字段或取值、超出数量限制返回 `400`；数据库不可用返回 `503`。
+
+成功响应与列表接口一致：`{ "code": 0, "message": "查询成功", "data": [...] }`，没有匹配用户时返回空数组，而不是 `404`。当前不分页、不提供总数或排序参数；未知但合法的动态字段可用于查询，具体结果由用户记录决定。数据量增大时应结合实际筛选组合评估索引和分页，本次没有自动创建新的用户索引。
 
 ## 调用示例
 
@@ -294,7 +370,18 @@ methods: {
 </el-select>
 ```
 
-只需要一个类型的页面从读取结果中取对应对象，不再调用旧单类型接口。用户列表可按 `value -> label` 建立映射以显示名称，停用项仍能回显。用户列表接口本身仍返回稳定代码，不自动附加字典名称。管理页保留完整源数组；业务页面可以计算启用项视图，但不得将过滤后的数组用于全量保存。
+只需要一个类型的页面从读取结果中取对应对象，不再调用旧单类型接口。用户列表和搜索结果已包含字典名称，前端自行决定显示 `label`，无需再次建立名称映射。编辑回填取 `value`，下拉框仍绑定字符串，例如：
+
+```js
+const departmentLabel = row.departmentCode?.label ?? '-';
+const form = { departmentCode: row.departmentCode?.value ?? null };
+const response = await axios.post(`/api/users/${row._id}`, form);
+if (response.data.code !== 0) throw new Error(response.data.message);
+```
+
+职务和职级同理，分别读取 `positionCode.label` / `positionCode.value`、`rankCode.label` / `rankCode.value`，注意处理字段缺失及 `label: null`。不要直接提交完整响应行，响应中的 `_id` 和字典对象不是可写字段值；只提取需要修改的字段。
+
+管理页保留完整源数组；业务页面可以计算启用项视图，但不得将过滤后的数组用于全量保存。
 
 用户新增、编辑以及 Excel 导入会在写入前检查上述三个字段：非空值必须是本类型下存在且启用的选项字符串，空字符串和 `null` 表示未选择。编辑时未提交的字段不变，提交与原记录相同的历史代码也允许保留，包括停用值；换成其他值则必须启用。
 

@@ -7,6 +7,7 @@ const router = express.Router();
 router.use(prepareRequest);
 
 router.get('/list', asyncHandler(controller.listUsers));
+router.post('/search', asyncHandler(controller.searchUsers));
 router.post('/', asyncHandler(controller.createUser));
 router.post('/import', uploadExcel, asyncHandler(controller.importUsers));
 router.post('/:id', asyncHandler(controller.updateUser));
