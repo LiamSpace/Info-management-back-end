@@ -59,7 +59,11 @@ async function createUser(input) {
 }
 
 async function importUsers(buffer) {
-  const users = await parseUsers(buffer);
+  const options = await mongoose.connection.db.collection('dictionary-options').find(
+    { type: { $in: Object.keys(dictionaryTypes) }, enabled: true },
+    { projection: { _id: 0, type: 1, label: 1, value: 1 } }
+  ).toArray();
+  const users = await parseUsers(buffer, options);
   await validateReferences(users);
   const result = await collection().insertMany(users, { ordered: true });
   return {

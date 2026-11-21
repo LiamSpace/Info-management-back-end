@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const { before, after, beforeEach, test } = require('node:test');
 const mongoose = require('mongoose');
 const ExcelJS = require('exceljs');
+const XLSX = require('xlsx');
 const originalCorsOrigins = process.env.CORS_ORIGINS;
 const frontendOrigin = 'http://192.168.31.190:8002';
 process.env.CORS_ORIGINS = frontendOrigin;
@@ -114,7 +115,12 @@ function assertEnvelope(response, body) {
   if (!response.ok) assert.equal(body.data, null);
 }
 
-async function importRows(rows) {
+async function importRows(rows, format = 'xlsx') {
+  if (format === 'xls') {
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), 'Users');
+    return uploadFile(XLSX.write(workbook, { type: 'buffer', bookType: 'biff8', bookSST: true }), 'users.xls');
+  }
   const workbook = new ExcelJS.Workbook();
   workbook.addWorksheet('Users').addRows(rows);
   return uploadFile(await workbook.xlsx.writeBuffer());
@@ -444,6 +450,103 @@ test('imports xlsx rows and preserves text phone numbers, zero and false', async
   assert.equal(imported[0].active, false);
 });
 
+test('imports xls with Chinese headers, dates, text identifiers and scalar conversions', async () => {
+  const result = await importRows([
+    ['姓名', '性别', '手机号码', '身份证号', '出生年月', '任职进修班', '理论测试', 'age'],
+    ['Alice', '男', '00123', '001234567890123456', '2026-02', '是', '否', 0],
+    [],
+    ['Bob', '女', '00456', '001234567890123457', { t: 'n', v: 46054, z: 'yyyy-mm-dd' }, false, true, 25]
+  ], 'xls');
+  assert.equal(result.status, 201);
+  assert.equal(result.body.data.insertedCount, 2);
+  const [first, second] = [...records.values()];
+  assert.equal(first.tel, '00123');
+  assert.equal(first.id_number, '001234567890123456');
+  assert.equal(first.sex, 0);
+  assert.equal(first.is_advanced_class, true);
+  assert.equal(first.theoretical_test, false);
+  assert.equal(first.age, 0);
+  assert.equal(second.birth_date, '2026-02');
+  assert.equal(second.sex, 1);
+  assert.equal(second.is_advanced_class, false);
+  assert.equal(second.theoretical_test, true);
+});
+
+test('maps Chinese Excel headers to English fields independently of column order', async () => {
+  const result = await importRows([
+    [' 手机号 ', '姓名'], ['00123', 'Alice']
+  ]);
+  assert.equal(result.status, 201);
+  const [user] = [...records.values()];
+  assert.equal(user.name, 'Alice');
+  assert.equal(user.tel, '00123');
+  assert.equal(Object.hasOwn(user, '姓名'), false);
+  assert.equal(Object.hasOwn(user, '手机号'), false);
+});
+
+test('maps worker table Excel headers to the actual API fields', async () => {
+  const result = await importRows([
+    ['姓名', '性别', '身份证号', '手机号码', '出生年月', '民族', '学历', '级别',
+      '任现职时间', '任现职级时间', '任职进修班', '理论测试'],
+    ['Alice', 1, '001234567890123456', '00123', '2026-02', '汉族', '本科', '一级',
+      '2026-10', '2026-12', true, false]
+  ]);
+  assert.equal(result.status, 201);
+  const [{ _id, ...user }] = [...records.values()];
+  assert.deepEqual(user, {
+    name: 'Alice', sex: 1, id_number: '001234567890123456', tel: '00123',
+    birth_date: '2026-02', ethnic: '汉族', educational: '本科', level: '一级',
+    tenure: '2026-10', tenure_of_position: '2026-12', is_advanced_class: true,
+    theoretical_test: false
+  });
+});
+
+test('converts worker Excel display values to API scalar types and year-month strings', async () => {
+  const result = await importRows([
+    ['姓名', '性别', '任职进修班', '理论测试', '出生年月', '任现职时间', '任现职级时间', '手机号码'],
+    ['Alice', ' 男 ', ' 是 ', '否', new Date('2026-02-01T00:00:00Z'), '2026-10', '2026-12', 13800138000],
+    ['Bob', '女', '否', '是', '2026-03', new Date('2026-11-15T00:00:00Z'), new Date('2026-07-01T00:00:00Z'), '00123'],
+    ['Carol', ' ', '', null, '', null, '', '']
+  ]);
+  assert.equal(result.status, 201);
+  const [first, second, third] = [...records.values()];
+  assert.equal(first.sex, 0);
+  assert.equal(first.is_advanced_class, true);
+  assert.equal(first.theoretical_test, false);
+  assert.equal(first.birth_date, '2026-02');
+  assert.equal(first.tel, '13800138000');
+  assert.equal(second.sex, 1);
+  assert.equal(second.is_advanced_class, false);
+  assert.equal(second.theoretical_test, true);
+  assert.equal(second.tenure, '2026-11');
+  assert.equal(second.tenure_of_position, '2026-07');
+  assert.equal(second.tel, '00123');
+  assert.equal(third.sex, '');
+});
+
+test('rejects invalid worker Excel display values before writing', async () => {
+  for (const [header, value] of [
+    ['性别', '未知'], ['性别', 2], ['性别', false],
+    ['任职进修班', '不确定'], ['理论测试', 'false'], ['理论测试', 1],
+    ['出生年月', '2026-13'], ['任现职时间', '2026/01'], ['任现职级时间', 45000],
+    ['身份证号', 123456789012345678], ['手机号码', false]
+  ]) {
+    const result = await importRows([['姓名', header], ['Alice', null], [], ['Bob', value]]);
+    assert.equal(result.status, 400);
+    assert.match(result.body.message, /第 4 行、第 2 列/);
+    assert.equal(records.size, 0);
+  }
+});
+
+test('rejects unknown Chinese headers and duplicate mapped fields before writing', async () => {
+  for (const headers of [['未知字段'], ['姓名', 'name'], ['岗位', '职务'],
+    ['手机号码', '手机号'], ['手机号码', 'tel'], ['#'], ['操作']]) {
+    const result = await importRows([headers, headers.map(() => 'Alice')]);
+    assert.equal(result.status, 400);
+    assert.equal(records.size, 0);
+  }
+});
+
 test('rejects invalid Excel headers, formulas and row limits before writing', async () => {
   const invalidSheets = [
     [], [['name']], [['name'], [' ']],
@@ -462,12 +565,76 @@ test('rejects invalid Excel headers, formulas and row limits before writing', as
   }
 });
 
+test('rejects xls headers, empty sheets, invalid fields and limits before writing', async () => {
+  const invalidSheets = [
+    [], [['姓名']], [['姓名'], [' ']],
+    [['姓名', 'name'], ['Alice', 'Bob']], [['_id'], ['forbidden']],
+    [['姓名', null, '手机号码'], ['Alice', null, '123']],
+    [['姓名'], ['Alice'], ['Bob', 'extra']],
+    [['姓名'], ['Alice'], ['a'.repeat(4001)]],
+    [['姓名'], ...Array.from({ length: 1001 }, () => ['Alice'])],
+    [Array.from({ length: 51 }, (_, index) => `field${index}`), Array(51).fill('value')],
+    [['姓名', '性别'], ['Alice', '男'], [], ['Bob', 'invalid']]
+  ];
+  for (const rows of invalidSheets) {
+    const result = await importRows(rows, 'xls');
+    assert.equal(result.status, 400);
+    assert.equal(records.size, 0);
+  }
+});
+
+test('rejects actual BIFF formulas, hyperlinks and error cells with physical row numbers', async () => {
+  const formula = { t: 'n', v: 1, bf: Buffer.from([3, 0, 0x1e, 1, 0]) };
+  for (const cell of [formula, { t: 's', v: 'Site', l: { Target: 'https://example.com' } }, { t: 'e', v: 7 }]) {
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+      ['姓名'], ['Alice'], [], [cell]
+    ]), 'Users');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'biff8' });
+    if (cell === formula) {
+      assert.equal(XLSX.read(buffer, { type: 'buffer', cellFormula: true }).Sheets.Users.A4.f, '1');
+    }
+    const result = await uploadFile(buffer, 'users.XLS');
+    assert.equal(result.status, 400);
+    assert.match(result.body.message, /第 4 行、第 1 列不支持公式、超链接或错误值/);
+    assert.equal(records.size, 0);
+  }
+});
+
+test('xls uses only the first worksheet and handles the 1904 date system in UTC', async () => {
+  const workbook = XLSX.utils.book_new();
+  workbook.Workbook = { WBProps: { date1904: true } };
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ['姓名', '出生年月', 'date'], ['Alice', { t: 'n', v: 0, z: 'yyyy-mm-dd' }, { t: 'n', v: 0.5, z: 'yyyy-mm-dd hh:mm' }]
+  ]), 'Users');
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['姓名'], ['Ignored']]), 'Second');
+  const result = await uploadFile(XLSX.write(workbook, { type: 'buffer', bookType: 'biff8' }), 'users.xls');
+  assert.equal(result.status, 201);
+  assert.equal(result.body.data.insertedCount, 1);
+  const [user] = [...records.values()];
+  assert.equal(user.birth_date, '1904-01');
+  assert.equal(user.date, '1904-01-01T12:00:00.000Z');
+  records.clear();
+  workbook.Sheets.Users = XLSX.utils.aoa_to_sheet([['姓名']]);
+  const empty = await uploadFile(XLSX.write(workbook, { type: 'buffer', bookType: 'biff8' }), 'users.xls');
+  assert.equal(empty.status, 400);
+  assert.equal(records.size, 0);
+});
+
 test('rejects missing files, wrong extensions, corrupt files and oversized uploads', async () => {
   assert.equal((await request('/import', 'POST', {})).status, 400);
   assert.equal((await uploadFile('bad', 'users.xls')).status, 400);
   assert.equal((await uploadFile('bad')).status, 400);
+  assert.equal((await uploadFile('name\nAlice', 'users.csv')).status, 400);
+  for (const filename of ['users.xls', 'users.xlsx']) {
+    for (const content of ['name\nAlice', '<table><tr><td>name</td></tr><tr><td>Alice</td></tr></table>',
+      Buffer.from('d0cf11e0a1b11ae1', 'hex')]) {
+      assert.equal((await uploadFile(content, filename)).status, 400);
+    }
+  }
   assert.equal((await uploadFile('bad', 'users.xlsx', 'upload')).status, 400);
   assert.equal((await uploadFile(Buffer.alloc(5 * 1024 * 1024 + 1))).status, 413);
+  assert.equal((await uploadFile(Buffer.alloc(5 * 1024 * 1024 + 1), 'users.xls')).status, 413);
   assert.equal(records.size, 0);
 });
 

@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { randomUUID } = require('node:crypto');
 const mongoose = require('mongoose');
 const ExcelJS = require('exceljs');
+const XLSX = require('xlsx');
 const app = require('../app');
 const { ensureIndexes } = require('../modules/dictionaries/service');
 const { validateType, validateBatchUpdate, validateQuery } = require('../modules/dictionaries/validation');
@@ -155,11 +156,19 @@ async function readResponse(response) {
   return { status: response.status, ...result };
 }
 
-async function importUsers(rows) {
-  const workbook = new ExcelJS.Workbook();
-  workbook.addWorksheet('Users').addRows(rows);
+async function importUsers(rows, format = 'xlsx') {
+  let buffer;
+  if (format === 'xls') {
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), 'Users');
+    buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'biff8', bookSST: true });
+  } else {
+    const workbook = new ExcelJS.Workbook();
+    workbook.addWorksheet('Users').addRows(rows);
+    buffer = await workbook.xlsx.writeBuffer();
+  }
   const form = new FormData();
-  form.append('file', new Blob([await workbook.xlsx.writeBuffer()]), 'users.xlsx');
+  form.append('file', new Blob([buffer]), `users.${format}`);
   const response = await fetch(new URL('/api/users/import', baseUrl), { method: 'POST', body: form });
   return readResponse(response);
 }
@@ -795,6 +804,82 @@ test('Excel validates all dictionary references before inserting any users', asy
   const disabled = await importUsers([['name', 'departmentCode'], ['Charlie', 'finance']]);
   assert.equal(disabled.status, 400);
   assert.equal(users.size, 2);
+});
+
+test('Excel maps Chinese dictionary names by type and preserves English code columns', async () => {
+  const department = await seedOption('department', { label: 'Shared' });
+  const position = await seedOption('position', { label: 'Shared' });
+  const rank = await seedOption('rank', { label: 'Senior' });
+  await seedOption('department', { label: 'Shared', enabled: false });
+  const result = await importUsers([
+    ['部门', '姓名', '性别', '身份证号', '手机号码', '出生年月', '民族', '学历',
+      '职务', '职级', '级别', '任现职时间', '任现职级时间', '任职进修班', '理论测试'],
+    [' Shared ', 'Alice', '男', '001234567890123456', '00123', '2026-02', '汉族', '本科',
+      'Shared', 'Senior', '一级', '2026-10', '2026-12', '是', '否'],
+    [' ', 'Bob']
+  ]);
+  assert.equal(result.status, 201);
+  const [first, second] = [...users.values()];
+  assert.deepEqual(first, {
+    _id: first._id, departmentCode: department.value, name: 'Alice', sex: 0,
+    id_number: '001234567890123456', tel: '00123', birth_date: '2026-02',
+    ethnic: '汉族', educational: '本科', positionCode: position.value, rankCode: rank.value,
+    level: '一级', tenure: '2026-10', tenure_of_position: '2026-12',
+    is_advanced_class: true, theoretical_test: false
+  });
+  assert.equal(second.departmentCode, '');
+  const mixed = await importUsers([
+    ['姓名', 'departmentCode', '岗位'], ['Carol', department.value, 'Shared']
+  ]);
+  assert.equal(mixed.status, 201);
+  const third = [...users.values()][2];
+  assert.equal(third.departmentCode, department.value);
+  assert.equal(third.positionCode, position.value);
+});
+
+test('Excel rejects unknown, disabled, ambiguous and non-string dictionary names before writing', async () => {
+  await seedOption('department', { value: 'finance-code', label: 'Finance' });
+  await seedOption('department', { label: 'Disabled', enabled: false });
+  await seedOption('department', { label: 'Duplicate' });
+  await seedOption('department', { label: 'Duplicate' });
+  await seedOption('position', { label: 'Position only' });
+  for (const value of ['Missing', 'Disabled', 'Duplicate', 'Position only', 'finance-code', 123, false]) {
+    const result = await importUsers([
+      ['姓名', '部门'], ['Alice', 'Finance'], [], ['Bob', value]
+    ]);
+    assert.equal(result.status, 400);
+    assert.match(result.message, /第 4 行、第 2 列/);
+    assert.equal(users.size, 0);
+    if (value === 'Duplicate') assert.match(result.message, /重名/);
+  }
+});
+
+test('xls imports resolve dictionary labels and reject invalid references before inserting', async () => {
+  const department = await seedOption('department', { label: '财务部' });
+  const position = await seedOption('position', { label: '会计' });
+  const rank = await seedOption('rank', { label: '初级' });
+  await seedOption('department', { label: '停用部门', enabled: false });
+  await seedOption('department', { label: '重名部门' });
+  await seedOption('department', { label: '重名部门' });
+  for (const value of ['不存在', '停用部门', '重名部门', '会计']) {
+    const rejected = await importUsers([
+      ['姓名', '部门'], ['Alice', '财务部'], [], ['Bob', value]
+    ], 'xls');
+    assert.equal(rejected.status, 400);
+    assert.match(rejected.message, /第 4 行、第 2 列/);
+    assert.equal(users.size, 0);
+  }
+  const result = await importUsers([
+    ['姓名', '部门', '职务', '职级', '手机号码'], ['Alice', ' 财务部 ', '会计', '初级', '00123']
+  ], 'xls');
+  assert.equal(result.status, 201);
+  const [user] = [...users.values()];
+  assert.equal(user.departmentCode, department.value);
+  assert.equal(user.positionCode, position.value);
+  assert.equal(user.rankCode, rank.value);
+  assert.equal(user.tel, '00123');
+  const codes = await importUsers([['name', 'departmentCode'], ['Bob', department.value]], 'xls');
+  assert.equal(codes.status, 201);
 });
 
 test('dictionary validation normalizes labels and IDs without introducing writable fields', () => {

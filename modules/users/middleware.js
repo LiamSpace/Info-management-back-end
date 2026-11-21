@@ -7,8 +7,8 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 0 },
   fileFilter(req, file, callback) {
-    if (!/\.xlsx$/i.test(file.originalname)) {
-      return callback(invalid('仅支持 .xlsx 文件'));
+    if (!/\.(xls|xlsx)$/i.test(file.originalname)) {
+      return callback(invalid('仅支持 .xls 或 .xlsx 文件'));
     }
     callback(null, true);
   }
